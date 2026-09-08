@@ -1,11 +1,13 @@
-
 #!/usr/bin/env python3
 """おけぴ掲示板の検索結果を定期取得し、新着投稿を Slack に通知する。
 
+監視対象は targets.json に列挙する。1件ごとに state/<id>.json で
+既知の投稿IDを持ち、増えた分だけ Slack に流す。
+
 環境変数:
-  OKEPI_URL          監視対象の検索結果URL（必須）
   SLACK_WEBHOOK_URL  Slack Incoming Webhook のURL（必須）
-  MAX_NOTIFY         1回の実行で個別通知する上限（既定 10）
+  MAX_NOTIFY         1対象・1回の実行で個別通知する上限（既定 10）
+  OKEPI_URL          targets.json が無い場合のみ使う単一URL（旧方式）
 """
 
 import json
@@ -13,17 +15,20 @@ import os
 import pathlib
 import re
 import sys
+import time
+import traceback
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-URL = os.environ["OKEPI_URL"]
 WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
 MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY", "10"))
 
-STATE_PATH = pathlib.Path("state/seen.json")
-KEEP = 500  # 保持する既知ID数の上限
+TARGETS_PATH = pathlib.Path("targets.json")
+STATE_DIR = pathlib.Path("state")
+KEEP = 500  # 対象ごとに保持する既知ID数の上限
+SLEEP = 2   # 対象間の待ち時間（秒）
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -38,24 +43,42 @@ ID_RE = re.compile(r"/bbs/posting/detail/(\d+)")
 UPDATED_RE = re.compile(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}")
 TAIL_RE = re.compile(r"\s*(?:新着)?\d*\s*hit\s*\(\s*\d+\s*\)\s*$")
 
-
-def tidy(text):
-    """末尾の閲覧数・問合せ数を落とす（更新日時までは残す）。"""
-    hits = list(UPDATED_RE.finditer(text))
-    if hits:
-        return text[: hits[-1].end()].strip()
-    return TAIL_RE.sub("", text).strip()
+ID_OK_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def load_state():
-    if not STATE_PATH.exists():
-        return {"seen": [], "last_count": 0, "warned": False}
-    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+def load_targets():
+    """[{"id":..., "name":..., "url":...}, ...] を返す。"""
+    if TARGETS_PATH.exists():
+        targets = json.loads(TARGETS_PATH.read_text(encoding="utf-8"))
+    elif os.environ.get("OKEPI_URL"):
+        targets = [{"id": "default", "name": "おけぴ", "url": os.environ["OKEPI_URL"]}]
+    else:
+        sys.exit("targets.json も OKEPI_URL も見つかりません。")
+
+    for t in targets:
+        if not ID_OK_RE.match(t.get("id", "")):
+            sys.exit(f"id は半角英数・ハイフン・アンダースコアのみ: {t!r}")
+        t.setdefault("name", t["id"])
+    ids = [t["id"] for t in targets]
+    if len(ids) != len(set(ids)):
+        sys.exit("targets.json の id が重複しています。")
+    return targets
 
 
-def save_state(state):
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(
+def state_path(tid):
+    return STATE_DIR / f"{tid}.json"
+
+
+def load_state(tid):
+    p = state_path(tid)
+    if not p.exists():
+        return {"seen": [], "last_count": 0, "warned": False}, True
+    return json.loads(p.read_text(encoding="utf-8")), False
+
+
+def save_state(tid, state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_path(tid).write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
@@ -69,6 +92,14 @@ def fetch(url):
     res.raise_for_status()
     res.encoding = res.apparent_encoding or "utf-8"
     return res.text
+
+
+def tidy(text):
+    """末尾の閲覧数・問合せ数を落とす（更新日時までは残す）。"""
+    hits = list(UPDATED_RE.finditer(text))
+    if hits:
+        return text[: hits[-1].end()].strip()
+    return TAIL_RE.sub("", text).strip()
 
 
 def extract(page_html, base_url):
@@ -85,13 +116,11 @@ def extract(page_html, base_url):
 
         text = " ".join(a.get_text(" ", strip=True).split())
         if len(text) < 6:
-            # リンク文字が「詳細」等だけの場合は、囲みブロックの文言を使う
             block = a.find_parent(["li", "tr", "article", "section", "div"])
             if block:
                 text = " ".join(block.get_text(" ", strip=True).split())
-        text = tidy(text)
         items[pid] = {
-            "title": text[:300] or f"投稿 {pid}",
+            "title": tidy(text)[:300] or f"投稿 {pid}",
             "url": urljoin(base_url, a["href"]),
         }
     return items
@@ -102,49 +131,63 @@ def notify(text):
     res.raise_for_status()
 
 
-def main():
-    state = load_state()
+def process(target):
+    tid, name, url = target["id"], target["name"], target["url"]
+    state, first_run = load_state(tid)
     seen = set(state["seen"])
-    first_run = not STATE_PATH.exists()
 
-    page = fetch(URL)
-    items = extract(page, URL)
+    items = extract(fetch(url), url)
 
     # --- 取得ゼロ = 壊れた可能性。ログにHTMLの頭を出しつつ一度だけ警告する ---
     if not items:
-        print("!! 投稿を1件も抽出できませんでした。HTMLの先頭3000文字:", file=sys.stderr)
-        print(page[:3000], file=sys.stderr)
+        print(f"[{tid}] !! 投稿を1件も抽出できませんでした", file=sys.stderr)
         if state["last_count"] > 0 and not state["warned"]:
             notify(
-                ":warning: おけぴ監視: ページから投稿を抽出できませんでした。"
-                "サイト構造が変わった可能性があります（Actions のログを確認してください）。"
+                f":warning: おけぴ監視「{name}」: ページから投稿を抽出できませんでした。"
+                f"条件に合う投稿が無くなっただけかもしれませんが、"
+                f"サイト構造が変わった可能性もあります。\n{url}"
             )
             state["warned"] = True
-            save_state(state)
+            save_state(tid, state)
         return
 
     state["warned"] = False
     new_ids = [pid for pid in items if pid not in seen]
 
     if first_run:
-        print(f"初回実行: {len(items)}件を既知として登録し、通知はしません。")
+        print(f"[{tid}] 初回実行: {len(items)}件を既知として登録（通知なし）")
     elif new_ids:
-        print(f"新着 {len(new_ids)}件")
+        print(f"[{tid}] 新着 {len(new_ids)}件")
         for pid in new_ids[:MAX_NOTIFY]:
             it = items[pid]
-            notify(f":tickets: *おけぴ新着*\n{it['title']}\n{it['url']}")
+            notify(f":tickets: *{name}* 新着\n{it['title']}\n{it['url']}")
         if len(new_ids) > MAX_NOTIFY:
-            notify(
-                f"…ほか {len(new_ids) - MAX_NOTIFY} 件の新着があります\n{URL}"
-            )
+            notify(f"…「{name}」ほか {len(new_ids) - MAX_NOTIFY} 件の新着\n{url}")
     else:
-        print("新着なし")
+        print(f"[{tid}] 新着なし（{len(items)}件）")
 
-    # 既知IDを更新（新しいものを前に寄せて上限で切る）
     merged = list(dict.fromkeys(list(items.keys()) + state["seen"]))[:KEEP]
     state["seen"] = merged
     state["last_count"] = len(items)
-    save_state(state)
+    save_state(tid, state)
+
+
+def main():
+    targets = load_targets()
+    failed = []
+
+    for i, t in enumerate(targets):
+        if i:
+            time.sleep(SLEEP)
+        try:
+            process(t)
+        except Exception:
+            print(f"[{t['id']}] 失敗:", file=sys.stderr)
+            traceback.print_exc()
+            failed.append(t["id"])
+
+    if failed:
+        sys.exit(f"失敗した対象: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
