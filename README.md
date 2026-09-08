@@ -1,5 +1,4 @@
 # okepi-watch
-# okepi-watch
 
 おけぴ掲示板の検索結果ページを10分おきに見に行き、新着投稿を Slack に流す。
 
