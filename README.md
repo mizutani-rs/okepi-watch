@@ -14,8 +14,7 @@
 3. **リポジトリに値を登録**
    - Settings → Secrets and variables → Actions → **Secrets** タブ
      `SLACK_WEBHOOK_URL` = 発行した Webhook URL
-   - 同じ画面の **Variables** タブ
-     `OKEPI_URL` = 監視したい検索結果URL（長いままで可。ダブルクォート不要）
+   Variables の `OKEPI_URL` は不要（監視対象は `targets.json` で管理する）。
 
 4. **手動で1回流す**
    Actions タブ → okepi watch → Run workflow。
@@ -28,6 +27,27 @@
 - ログに「投稿を1件も抽出できませんでした」と出る場合は、`watch.py` の `ID_RE`
   （詳細ページURLから投稿IDを拾う正規表現）がサイト構造と合っていない。
   ログに出力される HTML の先頭を見て直す。
+
+## 監視対象の追加・削除
+
+`targets.json` を編集するだけ。1件ぶんのブロックを足せば次の実行から監視が始まる。
+
+```json
+{
+  "id": "electra",
+  "name": "エレクトラ",
+  "url": "https://okepi.net/bbs/posting?Keyword=...&TradeType=1&SortKey=UpdateTimeDesc"
+}
+```
+
+- `id` は半角英数・ハイフン・アンダースコアのみ。`state/<id>.json` のファイル名になる
+- `name` はSlack通知の見出しに出る。日本語で可
+- `url` はおけぴで検索した結果ページのURLをそのまま貼る
+- 追加した対象は初回実行では通知が飛ばない（既存分を既知として登録するだけ）
+- 削除するときはブロックを消す。`state/<id>.json` も消しておくと後で紛れない
+
+対象が増えるとその数だけリクエストが飛ぶ（間に2秒の待ちを入れている）。
+10件を超えるようなら実行間隔を広げる。
 
 ## 確認済みの仕様
 
